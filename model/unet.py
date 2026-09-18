@@ -435,6 +435,200 @@ class UNet(nn.Module):
         self.to(orig_device)
         return total_flops
  
+    def _estimate_stage_volumes(
+        self,
+        input_shape,
+        batch_size: int,
+        active_layers: int,
+    ) -> list[int]:
+        """Return active encoder-stage volumes as element counts."""
+        if len(input_shape) < 2:
+            raise ValueError("input_shape should be of the form (N, C, H, W, ...) .")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if not (1 <= active_layers <= len(self.channels)):
+            raise ValueError(
+                f"active_layers must be in [1, {len(self.channels)}], got {active_layers}"
+            )
+
+        spatial = list(input_shape[2:])
+        if not spatial:
+            raise ValueError("input_shape must include spatial dimensions.")
+
+        stage_volumes = []
+        current_spatial = spatial[:]
+        for level_idx, channels in enumerate(self.channels[:active_layers]):
+            if level_idx < len(self.strides):
+                current_spatial = [
+                    max(1, size // int(self.strides[level_idx]))
+                    for size in current_spatial
+                ]
+            stage_volumes.append(batch_size * channels * math.prod(current_spatial))
+
+        return stage_volumes
+
+    def _estimate_activation_memory(
+        self,
+        input_shape,
+        batch_size: int,
+        dtype: torch.dtype,
+        active_layers: int,
+    ) -> int:
+        """Estimate single-depth forward activations, including its output."""
+        stage_volumes = self._estimate_stage_volumes(
+            input_shape=input_shape,
+            batch_size=batch_size,
+            active_layers=active_layers,
+        )
+
+        # A shallow execution ends at a bypass block that still runs its decoder.
+        # Only a full-depth execution ends in the bottom block without a decoder
+        # at that stage.
+        decoder_levels = min(active_layers, len(self.channels) - 1)
+        output_elements = batch_size * self.out_channels * math.prod(input_shape[2:])
+        activation_elements = (
+            sum(stage_volumes)
+            + 2 * sum(stage_volumes[:decoder_levels])
+            + output_elements
+        )
+        bytes_per_value = torch.empty([], dtype=dtype).element_size()
+        return int(activation_elements * bytes_per_value)
+
+    def _vram_breakdown(
+        self,
+        *,
+        training_activation_bytes: int,
+        inference_activation_bytes: int,
+        batch_size: int,
+        dtype: torch.dtype,
+        optimizer: str,
+        optimizer_dtype: torch.dtype,
+        include_master_weights: bool,
+        buffer_fraction: float,
+        active_layers: int,
+        active_params: int,
+    ) -> dict:
+        """Build comparable training and inference VRAM estimates."""
+        bytes_per_param = torch.empty([], dtype=dtype).element_size()
+        optimizer_bytes_per_param = torch.empty(
+            [], dtype=optimizer_dtype
+        ).element_size()
+        total_params = sum(p.numel() for p in self.parameters())
+        weights = total_params * bytes_per_param
+        gradients = total_params * bytes_per_param
+
+        opt_name = optimizer.lower()
+        if opt_name in {"adam", "adamw"}:
+            optimizer_state = 2 * active_params * optimizer_bytes_per_param
+        elif opt_name == "sgd":
+            optimizer_state = active_params * optimizer_bytes_per_param
+        else:
+            optimizer_state = 2 * active_params * optimizer_bytes_per_param
+
+        master_weights = active_params * 4 if include_master_weights else 0
+
+        training_base = (
+            weights
+            + gradients
+            + optimizer_state
+            + master_weights
+            + training_activation_bytes
+        )
+        inference_base = weights + inference_activation_bytes
+        training_workspace = training_base * float(buffer_fraction)
+        inference_workspace = inference_base * float(buffer_fraction)
+        training_vram = training_base + training_workspace
+        inference_vram = inference_base + inference_workspace
+
+        return {
+            "params": int(total_params),
+            "active_params": int(active_params),
+            "weights_bytes": int(weights),
+            "gradients_bytes": int(gradients),
+            "optimizer_state_bytes": int(optimizer_state),
+            "optimizer_bytes_per_param": int(optimizer_bytes_per_param),
+            "master_weights_bytes": int(master_weights),
+            "training_activation_bytes": int(training_activation_bytes),
+            "inference_activation_bytes": int(inference_activation_bytes),
+            "training_workspace_bytes": int(training_workspace),
+            "inference_workspace_bytes": int(inference_workspace),
+            "training_vram_bytes": int(training_vram),
+            "inference_vram_bytes": int(inference_vram),
+            "training_vram_gb": float(training_vram / (1024 ** 3)),
+            "inference_vram_gb": float(inference_vram / (1024 ** 3)),
+            # Backward-compatible aliases point to the training estimate.
+            "activation_bytes": int(training_activation_bytes),
+            "workspace_bytes": int(training_workspace),
+            "total_vram_gb": float(training_vram / (1024 ** 3)),
+            "dtype": str(dtype),
+            "optimizer_dtype": str(optimizer_dtype),
+            "include_master_weights": bool(include_master_weights),
+            "batch_size": int(batch_size),
+            "active_layers": int(active_layers),
+        }
+
+    def estimate_vram(
+        self,
+        input_shape,
+        batch_size: Optional[int] = None,
+        dtype: torch.dtype = torch.float16,
+        optimizer: str = "adam",
+        buffer_fraction: float = 0.15,
+        active_layers: Optional[int] = None,
+        optimizer_dtype: torch.dtype = torch.float32,
+        include_master_weights: bool = False,
+    ) -> dict:
+        """
+        Return theoretical training and inference VRAM estimates.
+
+        Training includes weights, gradients, optimizer state, optional FP32 master
+        weights, saved activations, and workspace. Optimizer state defaults to FP32
+        independently of ``dtype``. Inference includes weights, forward activations,
+        the returned output, and workspace. These are planning estimates, not
+        measured CUDA peaks.
+        """
+        if batch_size is None:
+            batch_size = int(input_shape[0])
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+
+        if active_layers is None:
+            active_layers = self.active_layers
+        active_layers = int(active_layers)
+        if not (1 <= active_layers <= len(self.channels)):
+            raise ValueError(
+                f"active_layers must be in [1, {len(self.channels)}], got {active_layers}"
+            )
+
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.lower(), torch.float16)
+        if isinstance(optimizer_dtype, str):
+            optimizer_dtype = getattr(torch, optimizer_dtype.lower(), torch.float32)
+
+        active_params = sum(
+            parameter.numel()
+            for _, parameter in self.get_learnable_parameters(active_layers)
+        )
+
+        activations = self._estimate_activation_memory(
+            input_shape=input_shape,
+            batch_size=batch_size,
+            dtype=dtype,
+            active_layers=active_layers,
+        )
+        return self._vram_breakdown(
+            training_activation_bytes=activations,
+            inference_activation_bytes=activations,
+            batch_size=batch_size,
+            dtype=dtype,
+            optimizer=optimizer,
+            optimizer_dtype=optimizer_dtype,
+            include_master_weights=include_master_weights,
+            buffer_fraction=buffer_fraction,
+            active_layers=active_layers,
+            active_params=active_params,
+        )
+
     # ----------------------------
     # Forward
     # ----------------------------
@@ -550,6 +744,77 @@ class UNetMultiDepth(nn.Module):
  
         return total_flops
  
+    def estimate_vram(
+        self,
+        input_shape,
+        batch_size: Optional[int] = None,
+        dtype: torch.dtype = torch.float16,
+        optimizer: str = "adam",
+        buffer_fraction: float = 0.15,
+        optimizer_dtype: torch.dtype = torch.float32,
+        include_master_weights: bool = False,
+    ) -> dict:
+        """
+        Return training and inference VRAM estimates for all active exits.
+
+        Encoder features are shared. Training retains each exit's decoder graph;
+        inference runs the decoders sequentially under no_grad, so only the largest
+        decoder workspace is counted. Both modes retain every returned exit output.
+        Optimizer state defaults to FP32, and an FP32 master-weight copy can be
+        included for AMP implementations that maintain one.
+        """
+        if batch_size is None:
+            batch_size = int(input_shape[0])
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if isinstance(dtype, str):
+            dtype = getattr(torch, dtype.lower(), torch.float16)
+        if isinstance(optimizer_dtype, str):
+            optimizer_dtype = getattr(torch, optimizer_dtype.lower(), torch.float32)
+
+        stage_volumes = self.model._estimate_stage_volumes(
+            input_shape=input_shape,
+            batch_size=batch_size,
+            active_layers=self.active_layers,
+        )
+        decoder_elements = [
+            2 * sum(stage_volumes[:min(exit_depth, len(self.model.channels) - 1)])
+            for exit_depth in range(1, self.active_layers + 1)
+        ]
+        output_elements = (
+            batch_size
+            * self.model.out_channels
+            * math.prod(input_shape[2:])
+            * self.active_layers
+        )
+        encoder_elements = sum(stage_volumes)
+        bytes_per_value = torch.empty([], dtype=dtype).element_size()
+
+        training_activations = int(
+            (encoder_elements + sum(decoder_elements) + output_elements)
+            * bytes_per_value
+        )
+        inference_activations = int(
+            (encoder_elements + max(decoder_elements) + output_elements)
+            * bytes_per_value
+        )
+
+        return self.model._vram_breakdown(
+            training_activation_bytes=training_activations,
+            inference_activation_bytes=inference_activations,
+            batch_size=batch_size,
+            dtype=dtype,
+            optimizer=optimizer,
+            optimizer_dtype=optimizer_dtype,
+            include_master_weights=include_master_weights,
+            buffer_fraction=buffer_fraction,
+            active_layers=self.active_layers,
+            active_params=sum(
+                parameter.numel()
+                for _, parameter in self.get_learnable_parameters()
+            ),
+        )
+
  
  
 if __name__ == "__main__":
@@ -557,13 +822,13 @@ if __name__ == "__main__":
     # Shared test configuration
     # ----------------------------
     compute_capacities = [1, 2, 1, 4, 5]
-    input_shape = (10, 4, 160, 160, 160)
+    input_shape = (10, 4, 160, 160, 160) #(10, 3, 256, 256)  # (N, C, H, W) for 2D or (N, C, D, H, W) for 3D
  
  
     spatial_shape = input_shape[2:]
     spatial_dims = len(spatial_shape)
     in_channels = input_shape[1]
-    out_channels = 3
+    out_channels = 3#1
     channels = (16, 32, 64, 128, 256)
     strides = (2, 2, 2, 2)
     batch_size = input_shape[0]
@@ -617,11 +882,21 @@ if __name__ == "__main__":
         )
  
         total_flops = multi_depth_net.estimate_flops(input_shape=input_shape)
+        vram_estimate = multi_depth_net.estimate_vram(
+            input_shape=input_shape,
+            batch_size=batch_size,
+            dtype=torch.float16,
+            optimizer="adamw",
+            buffer_fraction=0.15,
+        )
  
         print(
             f"  active_layers={active_layers}: "
-            f"{total_flops / 1e9:.3f} GFLOPs"
+            f"Train: {3* total_flops / 1e9:.3f} GFLOPs, "
+            f"Train VRAM: {vram_estimate['training_vram_gb']:.3f} GB"
         )
+
+    print("Inference foot print is same as single depth Unet, so not repeated here.")
  
     # ----------------------------
     # Single-depth UNet FLOPs
@@ -633,6 +908,14 @@ if __name__ == "__main__":
             active_layers=active_layers,
         )
  
+        vram_estimate = single_depth_net.estimate_vram(
+            input_shape=input_shape,
+            batch_size=batch_size,
+            dtype=torch.float16,
+            optimizer="adamw",
+            buffer_fraction=0.15,
+        )
+
         flops = single_depth_net.estimate_flops(
             input_shape=input_shape,
             active_layers=active_layers,
@@ -640,7 +923,10 @@ if __name__ == "__main__":
  
         print(
             f"  active_layers={active_layers}: "
-            f"{flops / 1e9:.3f} GFLOPs"
+            f"Train: {3* flops / 1e9:.3f} GFLOPs, "
+            f"Infer: {flops / 1e9:.3f} GFLOPs, "
+            f"Train VRAM: {vram_estimate['training_vram_gb']:.3f} GB, "
+            f"Infer VRAM: {vram_estimate['inference_vram_gb']:.3f} GB"
         )
 
     # ----------------------------
@@ -660,7 +946,7 @@ if __name__ == "__main__":
         print(
             f"\nClient {client_idx}: "
             f"compute_capacity={compute_capacity}, "
-            f"learnable params={len(learnable_params)}"
+            f"learnable params={len(learnable_params):.3f}"
         )
  
         for name, param in learnable_params:
@@ -696,4 +982,3 @@ if __name__ == "__main__":
                 f"shape={tuple(param.shape)}, "
                 f"numel={param.numel():,}"
             )
- 
